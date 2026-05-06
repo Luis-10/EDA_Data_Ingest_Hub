@@ -1,0 +1,206 @@
+# version: "3.8"
+
+services:
+  # ----------------------------------------------------------------
+  # 1. CLOUD SIMULATION (AWS: S3 + SQS)
+  # ----------------------------------------------------------------
+  localstack:
+    image: localstack/localstack:latest
+    container_name: aws-local
+    ports:
+      - "4566:4566" # Gateway principal para S3 y SQS
+      - "4510-4559:4510-4559" # Rango de puertos para servicios externos
+    environment:
+      - SERVICES=s3,sqs,sns # S3 + SQS + SNS (Event Bus central)
+      - DEBUG=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN}
+    volumes:
+      - "./localstack_setup:/etc/localstack/init/ready.d" # Scripts de inicio (crear buckets/colas)
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    networks:
+      - data-network
+
+  # ----------------------------------------------------------------
+  # 2. DATABASE (PostgreSQL)
+  # ----------------------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    container_name: postgres-db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: adminpassword
+      POSTGRES_DB: datahub_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command:
+      - "postgres"
+      - "-c"
+      - "max_wal_size=2GB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "effective_cache_size=1GB"
+    networks:
+      - data-network
+
+  # ----------------------------------------------------------------
+  # 3. BACKEND API (FastAPI - Producer)
+  # ----------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fastapi-backend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - DATABASE_URL=postgresql+psycopg://admin:adminpassword@db:5432/datahub_db
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - WATCHFILES_FORCE_POLLING=true
+      - AWS_REGION=us-east-1
+      - SNS_BASE_ARN=arn:aws:sns:us-east-1:000000000000
+      - S3_BUCKET=raw-data
+      - SQS_BASE_URL=http://localstack:4566/000000000000
+      - ETL_PARALLEL_WORKERS=5
+    depends_on:
+      - db
+      - localstack
+    networks:
+      - data-network
+
+  # ----------------------------------------------------------------
+  # 4. FRONTEND (Vue 3 + Vite + pnpm)
+  # ----------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vue-frontend
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      - API_TARGET=http://backend:8000
+      - CI=true
+    depends_on:
+      - backend
+    networks:
+      - data-network
+
+  # ----------------------------------------------------------------
+  # 5. SPARK WORKER / CONSUMER (The Heavy Lifter)
+  # ----------------------------------------------------------------
+  # Nota de Arquitecto: Usamos apache/spark porque es la imagen oficial estable.
+  # Este contenedor ejecutará el script que escucha SQS o procesa el archivo.
+  spark-processor:
+    image: apache/spark:3.5.0
+    # container_name removido para permitir múltiples réplicas
+    # Docker Compose asignará nombres automáticamente: spark-processor-1, spark-processor-2, etc.
+    user: root
+    command: >
+      /bin/bash -c "
+      pip install --quiet boto3 sqlalchemy psycopg2-binary prometheus-client jsonschema &&
+      /opt/spark/bin/spark-submit
+      --packages org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.6.0,com.crealytics:spark-excel_2.12:3.5.1_0.20.4,com.microsoft.sqlserver:mssql-jdbc:12.4.2.jre8
+      --conf spark.hadoop.fs.s3a.endpoint=http://localstack:4566
+      --conf spark.hadoop.fs.s3a.access.key=test
+      --conf spark.hadoop.fs.s3a.secret.key=test
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+      /app/jobs/consumer.py
+      "
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - DATABASE_URL=postgresql://admin:adminpassword@db:5432/datahub_db
+      - SPARK_HADOOP_FS_S3A_ENDPOINT=http://localstack:4566
+      - SPARK_HADOOP_FS_S3A_ACCESS_KEY=test
+      - SPARK_HADOOP_FS_S3A_SECRET_KEY=test
+      - SPARK_HADOOP_FS_S3A_PATH_STYLE_ACCESS=true
+      - SPARK_HADOOP_FS_S3A_IMPL=org.apache.hadoop.fs.s3a.S3AFileSystem
+      - SQLSERVER_HOST=${SQLSERVER_HOST:-}
+      - SQLSERVER_PORT=${SQLSERVER_PORT:-1433}
+      - SQLSERVER_USER=${SQLSERVER_USER:-}
+      - SQLSERVER_PASSWORD=${SQLSERVER_PASSWORD:-}
+      - SQLSERVER_DB_TARIFAS=${SQLSERVER_DB_TARIFAS:-mxTarifas}
+      - SQLSERVER_DB_SAC=${SQLSERVER_DB_SAC:-appSAC}
+    volumes:
+      - ./spark-jobs:/app/jobs # Aquí pondrás tus scripts .py
+    networks:
+      - data-network
+    depends_on:
+      - localstack
+      - db
+    deploy:
+      replicas: 2  # 2 consumers en paralelo (puedes aumentar a 3-5 según necesites)
+
+  # ----------------------------------------------------------------
+  # OBSERVABILITY: Prometheus para métricas
+  # ----------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - data-network
+
+  # ----------------------------------------------------------------
+  # OBSERVABILITY: Grafana para visualización
+  # ----------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"  # Puerto 3001 para no conflictar con frontend
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3001
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource,grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+    networks:
+      - data-network
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+  frontend_node_modules:
+
+networks:
+  data-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
